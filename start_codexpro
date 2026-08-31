@@ -1,0 +1,224 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+SCRIPT_NAME="${0:t}"
+DEFAULT_MODE="agent"
+
+# Workspace 配置文件。
+# 可通过 CODEXPRO_WORKSPACES_FILE 环境变量覆盖。
+WORKSPACE_FILE="${CODEXPRO_WORKSPACES_FILE:-$HOME/.codexpro/workspaces.json}"
+
+show_usage() {
+    cat <<EOF
+用法：
+  $SCRIPT_NAME [agent|handoff] [额外参数...]
+
+模式：
+  agent      普通代理模式，默认值
+  handoff    规划交接模式，只生成 handoff 计划
+
+Workspace 配置：
+  默认读取：
+    $WORKSPACE_FILE
+
+  JSON 数组规则：
+    第一项    默认/启动 workspace
+    后续项    额外允许的 workspace
+
+说明：
+  - workspace 统一由 JSON 配置管理，因此禁止额外指定 --root。
+  - 脚本从哪个目录执行都不会影响默认 workspace。
+  - JSON 第一项始终作为 CodexPro 默认 workspace。
+  - 其他参数会原样透传给 codexpro start。
+  - 脚本依赖 jq 解析 JSON。
+
+基本示例：
+
+  # 默认 agent 模式
+  $SCRIPT_NAME
+
+  # 显式指定 agent 模式
+  $SCRIPT_NAME agent
+
+  # handoff 模式
+  $SCRIPT_NAME handoff
+
+  # 指定 CodexPro 监听端口
+  $SCRIPT_NAME --port 8787
+
+  # handoff 模式并指定端口
+  $SCRIPT_NAME handoff --port 8787
+
+  # handoff 模式，关闭 bash，并指定端口
+  $SCRIPT_NAME handoff --port 8787 --no-bash
+
+从其他目录启动：
+
+  cd /tmp
+  $SCRIPT_NAME --port 8787
+
+  即使从 /tmp 启动，CodexPro 默认 workspace
+  仍然由 JSON 第一项决定。
+
+指定其他 Workspace 配置文件：
+
+  CODEXPRO_WORKSPACES_FILE=/path/to/workspaces.json $SCRIPT_NAME
+
+如果脚本安装在 ~/bin：
+
+  ~/bin/start_codexpro.sh
+  ~/bin/start_codexpro.sh --port 8787
+  ~/bin/start_codexpro.sh handoff --port 8787
+
+默认 Workspace 配置文件示例：
+
+  ~/.config/codexpro/workspaces.json
+
+内容：
+
+  [
+    "/home/lius/sda1/tmp/github/bian_trade_rule-dev",
+    "/home/lius/sda1/tmp/cnb/paperclip_lius",
+    "/home/lius/.local/share/distrobox/homes/simulink-agentic/paperclip_lius",
+    "/home/lius/tmp/cp_qemu/CP_Project",
+    "/home/lius/tmp/matlab"
+  ]
+
+查看帮助：
+
+  $SCRIPT_NAME --help
+  $SCRIPT_NAME -h
+EOF
+}
+
+MODE="$DEFAULT_MODE"
+
+# 第一个参数如果是模式，则读取并移除。
+if (( $# > 0 )); then
+    case "$1" in
+        agent|handoff)
+            MODE="$1"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+    esac
+fi
+
+# --mode 由脚本统一管理。
+# --root 由 JSON 第一项统一管理。
+for arg in "$@"; do
+    case "$arg" in
+        --mode|--mode=*)
+            print -u2 "错误：请通过脚本第一个参数选择 agent 或 handoff。"
+            exit 1
+            ;;
+        --root|--root=*)
+            print -u2 "错误：workspace 由 $WORKSPACE_FILE 统一配置，不要指定 --root。"
+            exit 1
+            ;;
+    esac
+done
+
+# 依赖 jq 解析 JSON。
+if ! command -v jq >/dev/null 2>&1; then
+    print -u2 "错误：未找到 jq，请先安装 jq。"
+    exit 1
+fi
+
+if [[ ! -f "$WORKSPACE_FILE" ]]; then
+    print -u2 "错误：Workspace 配置文件不存在："
+    print -u2 "  $WORKSPACE_FILE"
+    exit 1
+fi
+
+# 配置必须是：
+#   - 非空数组
+#   - 所有元素都是非空字符串
+#   - 所有路径都是绝对路径
+if ! jq -e '
+    type == "array" and
+    length > 0 and
+    all(.[]; type == "string" and length > 0 and startswith("/"))
+' "$WORKSPACE_FILE" >/dev/null; then
+    print -u2 "错误：Workspace 配置格式无效。"
+    print -u2 "要求：非空 JSON 字符串数组，并且所有项必须是绝对路径。"
+    exit 1
+fi
+
+typeset -a WORKSPACES
+WORKSPACES=("${(@f)$(jq -r '.[]' "$WORKSPACE_FILE")}")
+
+# 先完整检查目录，确认无误后才修改 CodexPro settings。
+typeset -A SEEN
+
+for workspace in "${WORKSPACES[@]}"; do
+    if [[ ! -d "$workspace" ]]; then
+        print -u2 "错误：Workspace 目录不存在："
+        print -u2 "  $workspace"
+        exit 1
+    fi
+
+    if [[ -n "${SEEN[$workspace]-}" ]]; then
+        print -u2 "错误：Workspace 配置重复："
+        print -u2 "  $workspace"
+        exit 1
+    fi
+
+    SEEN[$workspace]=1
+done
+
+PRIMARY_WORKSPACE="${WORKSPACES[1]}"
+
+#
+# CodexPro settings 是针对 launch workspace 保存的。
+#
+cd "$PRIMARY_WORKSPACE"
+
+#
+# JSON 是唯一 workspace 配置源。
+#
+# 每次启动：
+#   1. 清除旧 additional projects
+#   2. 按当前 JSON 重新添加
+#
+codexpro settings set --clear-projects
+
+if (( ${#WORKSPACES} > 1 )); then
+    typeset -a PROJECT_ARGS
+    PROJECT_ARGS=()
+
+    for (( i = 2; i <= ${#WORKSPACES}; i++ )); do
+        PROJECT_ARGS+=(--project "${WORKSPACES[$i]}")
+    done
+
+    codexpro settings set "${PROJECT_ARGS[@]}"
+fi
+
+export CODEXPRO_LOW_FRICTION_TOOLS=1
+export TUNNEL_TRANSPORT_PROTOCOL=http2
+
+print
+print "CodexPro 启动参数："
+print "  mode   : $MODE"
+print "  root   : $PRIMARY_WORKSPACE"
+print "  config : $WORKSPACE_FILE"
+print
+print "允许的 Workspaces："
+
+for workspace in "${WORKSPACES[@]}"; do
+    print "  - $workspace"
+done
+
+print
+
+exec codexpro start \
+    --root "$PRIMARY_WORKSPACE" \
+    --mode "$MODE" \
+    --tool-cards off \
+    --tool-mode standard \
+    --bash-transcript compact \
+    "$@"
